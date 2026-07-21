@@ -37,7 +37,7 @@ It doesn't need an API key and it doesn't make network calls. The `claude://` an
 
 ## Install
 
-This isn't on the Raycast Store yet, so you'll need to run it from source:
+This isn't on the Raycast Store yet ([the submission](https://github.com/raycast/extensions/pull/29627) is under review), so for now you run it from source:
 
 ```bash
 git clone git@github.com:luiseugenio/raycast-claude-sessions.git
@@ -69,4 +69,3 @@ npm run dev
 
 - "Import into Claude Desktop" always works, but if Desktop already tracks that session under a different internal ID, the import can create a second untitled copy there. That's a Claude Desktop quirk, not something this extension can avoid yet. It's also why Enter just focuses Claude Desktop: the default action should never surprise you.
 - The "(experimental)" open-session action tries a deep link found by digging into how the desktop app routes URLs. It isn't confirmed to work on every build, so it's opt-in and labeled as such.
-- TODO before submitting to the Raycast Store: take the screenshots with Raycast's own window capture tool.
