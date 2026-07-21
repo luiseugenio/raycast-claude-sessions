@@ -1,5 +1,4 @@
 import { createReadStream, promises as fs, existsSync } from "fs";
-import { createInterface } from "readline";
 import { homedir } from "os";
 import { join, basename } from "path";
 
@@ -153,90 +152,182 @@ function capText(text: string, maxLength: number): string {
   return `${trimmed.slice(0, maxLength).trimEnd()}…`;
 }
 
-/** Reads only the first `maxLines`/`maxBytes` of a file, one line at a time. */
+/**
+ * Reads only the first `maxBytes` of a file as raw bytes (a single bounded
+ * read, not a stream) and splits whatever's there into lines. Deliberately
+ * NOT readline-based: readline must buffer an entire line before it can emit
+ * it, so if line 1 of a file happened to be huge, a readline-based head
+ * reader could still balloon far past `maxBytes` before we ever get a chance
+ * to stop it. Reading a fixed byte budget up front has no such failure mode
+ * — memory use for this function is exactly `maxBytes`, always.
+ */
 async function readHeadLines(
   filePath: string,
   maxLines = HEAD_MAX_LINES,
   maxBytes = HEAD_MAX_BYTES,
 ): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath, { encoding: "utf8" });
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    const lines: string[] = [];
-    let bytes = 0;
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      rl.close();
-      stream.destroy();
-      resolve(lines);
-    };
-    rl.on("line", (line) => {
-      lines.push(line);
-      bytes += Buffer.byteLength(line, "utf8");
-      if (lines.length >= maxLines || bytes >= maxBytes) finish();
-    });
-    rl.on("close", finish);
-    stream.on("error", (err) => {
-      if (!settled) {
-        settled = true;
-        reject(err);
-      }
-    });
-  });
+  const fh = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await fh.read(buffer, 0, maxBytes, 0);
+    const text = buffer.toString("utf8", 0, bytesRead);
+    // The last line is likely a truncated partial line (we stopped at a byte
+    // budget, not a line boundary) — drop it unless we read the whole file.
+    const readWholeFile = bytesRead < maxBytes;
+    const rawLines = text.split("\n");
+    const lines = readWholeFile ? rawLines : rawLines.slice(0, -1);
+    return lines.slice(0, maxLines);
+  } finally {
+    await fh.close();
+  }
 }
 
+const SCAN_CHUNK_BYTES = 256 * 1024;
+/** Enough to see `type`/`isSidechain` near the start of a JSONL record — both appear well within this in every sample checked. */
+const CLASSIFY_WINDOW_BYTES = 4 * 1024;
+/** Cap for lines we actually parse in full (custom-title/ai-title are always tiny in practice) — never for user/assistant/anything else. */
+const MAX_MATERIALIZED_LINE_BYTES = 1024 * 1024;
+
+type ScanLineKind =
+  "unclassified" | "message" | "custom-title" | "ai-title" | "ignore";
+
 /**
- * Streams the whole file once, counting real (non-sidechain) user/assistant
- * messages and picking up the latest `custom-title`/`ai-title` records seen.
- * This is the only full-file pass we do, and only on a cache miss (mtime
- * changed since last scan).
+ * Streams the whole file once in fixed-size chunks, counting real
+ * (non-sidechain) user/assistant messages and picking up the latest
+ * `custom-title`/`ai-title` records seen. This is the only full-file pass we
+ * do, and only on a cache miss (mtime changed since last scan).
+ *
+ * Why not readline: readline's `line` event hands you the *complete* line as
+ * one string, however large — a single JSONL line can be many MB (a tool
+ * result embedding a big file or image), so readline must fully buffer it
+ * first. Buffer that per file, times however many files a background scan
+ * runs concurrently, and it adds up to exactly the "JS heap out of memory"
+ * crash reported on a machine with a large `~/.claude/projects`.
+ *
+ * Instead we track only a small amount of state per in-progress line:
+ * - While a line is `"unclassified"`, we buffer up to `CLASSIFY_WINDOW_BYTES`
+ *   of it — enough to see the `type`/`isSidechain` fields near the front of
+ *   every real record — then classify it once that threshold is hit (or the
+ *   line ends first, if it's short).
+ * - Once classified as a plain message or something to ignore, we drop the
+ *   buffered bytes immediately and just keep counting the byte length until
+ *   the line's terminating `\n` shows up — the rest of a huge message line
+ *   is never held in memory.
+ * - Only `custom-title`/`ai-title` lines (always tiny in the data we've
+ *   seen) keep accumulating, capped at `MAX_MATERIALIZED_LINE_BYTES`; if one
+ *   ever exceeds that cap we give up on it rather than materialize an
+ *   unbounded string.
+ *
+ * Net effect: peak memory held for any single line, no matter how large it
+ * actually is on disk, is bounded by `MAX_MATERIALIZED_LINE_BYTES` (1MB).
  */
 async function scanFullFile(
   filePath: string,
 ): Promise<{ messageCount: number; customTitle?: string; aiTitle?: string }> {
   return new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath, { encoding: "utf8" });
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    const stream = createReadStream(filePath, {
+      highWaterMark: SCAN_CHUNK_BYTES,
+    });
     let messageCount = 0;
     let customTitle: string | undefined;
     let aiTitle: string | undefined;
-    rl.on("line", (line) => {
-      // Cheap substring pre-checks avoid JSON.parse for the vast majority of lines.
+
+    // State for the line currently being accumulated across chunk callbacks.
+    let lineChunks: Buffer[] = [];
+    let lineBytes = 0;
+    let kind: ScanLineKind = "unclassified";
+
+    function classify() {
+      const prefix = Buffer.concat(lineChunks).toString("utf8");
       if (
-        line.includes('"type":"user"') ||
-        line.includes('"type": "user"') ||
-        line.includes('"type":"assistant"') ||
-        line.includes('"type": "assistant"')
+        prefix.includes('"type":"user"') ||
+        prefix.includes('"type": "user"') ||
+        prefix.includes('"type":"assistant"') ||
+        prefix.includes('"type": "assistant"')
       ) {
-        const record = safeParseLine(line);
+        const isSidechain =
+          prefix.includes('"isSidechain":true') ||
+          prefix.includes('"isSidechain": true');
+        kind = isSidechain ? "ignore" : "message";
+        lineChunks = []; // decision made — never need the rest of this line.
+      } else if (
+        prefix.includes('"type":"custom-title"') ||
+        prefix.includes('"type": "custom-title"')
+      ) {
+        kind = "custom-title"; // keep accumulating (bounded) for the real title string.
+      } else if (
+        prefix.includes('"type":"ai-title"') ||
+        prefix.includes('"type": "ai-title"')
+      ) {
+        kind = "ai-title";
+      } else {
+        kind = "ignore";
+        lineChunks = [];
+      }
+    }
+
+    function finishLine() {
+      if (kind === "unclassified") classify();
+      if (kind === "message") {
+        messageCount++;
+      } else if (kind === "custom-title" || kind === "ai-title") {
+        const full = Buffer.concat(lineChunks).toString("utf8");
+        const record = safeParseLine(full);
+        if (kind === "custom-title" && record?.customTitle)
+          customTitle = record.customTitle;
+        if (kind === "ai-title" && record?.aiTitle) aiTitle = record.aiTitle;
+      }
+      lineChunks = [];
+      lineBytes = 0;
+      kind = "unclassified";
+    }
+
+    stream.on("data", (rawChunk: Buffer | string) => {
+      // No `encoding` option is passed to `createReadStream`, so this stream
+      // always emits `Buffer`s in practice; the `string` half of the type is
+      // just `Readable`'s generic signature, not a real runtime case here.
+      const chunk =
+        typeof rawChunk === "string" ? Buffer.from(rawChunk) : rawChunk;
+      let offset = 0;
+      while (offset < chunk.length) {
+        const newlineIndex = chunk.indexOf(0x0a, offset);
+        const end = newlineIndex === -1 ? chunk.length : newlineIndex;
+        const piece = chunk.subarray(offset, end);
+
         if (
-          record &&
-          !record.isSidechain &&
-          (record.type === "user" || record.type === "assistant")
+          (kind === "unclassified" ||
+            kind === "custom-title" ||
+            kind === "ai-title") &&
+          lineBytes < MAX_MATERIALIZED_LINE_BYTES
         ) {
-          messageCount++;
+          lineChunks.push(piece);
         }
-        return;
-      }
-      if (
-        line.includes('"type":"custom-title"') ||
-        line.includes('"type": "custom-title"')
-      ) {
-        const record = safeParseLine(line);
-        if (record?.customTitle) customTitle = record.customTitle;
-        return;
-      }
-      if (
-        line.includes('"type":"ai-title"') ||
-        line.includes('"type": "ai-title"')
-      ) {
-        const record = safeParseLine(line);
-        if (record?.aiTitle) aiTitle = record.aiTitle;
+        lineBytes += piece.length;
+
+        if (kind === "unclassified" && lineBytes >= CLASSIFY_WINDOW_BYTES) {
+          classify();
+        }
+        if (
+          (kind === "custom-title" || kind === "ai-title") &&
+          lineBytes > MAX_MATERIALIZED_LINE_BYTES
+        ) {
+          // Exceeded the cap — give up on this one rather than keep growing.
+          kind = "ignore";
+          lineChunks = [];
+        }
+
+        if (newlineIndex !== -1) {
+          finishLine();
+          offset = newlineIndex + 1;
+        } else {
+          offset = chunk.length;
+        }
       }
     });
-    rl.on("close", () => resolve({ messageCount, customTitle, aiTitle }));
+    stream.on("end", () => {
+      if (lineBytes > 0) finishLine();
+      resolve({ messageCount, customTitle, aiTitle });
+    });
     stream.on("error", reject);
   });
 }
@@ -445,74 +536,136 @@ async function parseSessionFile(
   };
 }
 
-/** Scans every session file under `~/.claude/projects`. */
+/**
+ * Runs `fn` over `items` with at most `limit` calls in flight at once.
+ *
+ * `scanAllSessions` used to kick off a `parseSessionFile` call (which, on a
+ * cache miss, does a full-file streaming scan) for *every* session file
+ * across *every* project directory all at once via nested `Promise.all`.
+ * On a small `~/.claude/projects` that's fine, but on a machine with a large
+ * history — hundreds of session files, all cache-cold on a fresh clone — it
+ * means hundreds of file streams and their per-line state all alive at the
+ * same time. Each one alone is bounded (see `scanFullFile`), but unbounded
+ * *concurrency* multiplies that bound by however many files exist, which is
+ * exactly the kind of thing that scales fine on a laptop with a handful of
+ * projects and blows the heap on one with years of history. Capping how
+ * many run at once bounds total memory regardless of how many files exist.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]);
+    }
+  }
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+/** How many full-file scans (`parseSessionFile` on a cache miss) run at once. */
+const SCAN_CONCURRENCY = 3;
+
+interface ScanTask {
+  filePath: string;
+  projectDirName: string;
+  fileName: string;
+  treeCache: Record<string, TreeCacheEntry>;
+}
+
+/**
+ * Scans every session file under `~/.claude/projects`.
+ *
+ * `projectsDir` defaults to the real `~/.claude/projects` and is only ever
+ * overridden by the synthetic stress test in `scripts/smoke.ts`, which points
+ * it at a throwaway fixture directory instead — this module never writes to
+ * or reads from anywhere else on a real machine.
+ */
 export async function scanAllSessions(
   cache: KeyValueCache,
+  projectsDir: string = PROJECTS_DIR,
 ): Promise<SessionMeta[]> {
-  if (!existsSync(PROJECTS_DIR)) return [];
-  const projectDirs = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
-  const results: SessionMeta[] = [];
+  if (!existsSync(projectsDir)) return [];
+  const projectDirs = await fs.readdir(projectsDir, { withFileTypes: true });
 
-  await Promise.all(
+  // First, cheaply gather every (dir, file) pair to scan across all project
+  // directories into one flat list — listing directories and reading small
+  // `.tree-cache.json` files is not the expensive part, so it's fine to do
+  // this part concurrently; only the per-file parse below is pooled.
+  const tasksByDir = await Promise.all(
     projectDirs
       .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-      .map(async (entry) => {
-        const projectDir = join(PROJECTS_DIR, entry.name);
+      .map(async (entry): Promise<ScanTask[]> => {
+        const projectDir = join(projectsDir, entry.name);
         let files: string[];
         try {
           files = (await fs.readdir(projectDir)).filter(
             (f) => f.endsWith(".jsonl") && !f.startsWith("."),
           );
         } catch {
-          return;
+          return [];
         }
-
         const treeCache = await readTreeCache(projectDir);
-
-        await Promise.all(
-          files.map(async (fileName) => {
-            const filePath = join(projectDir, fileName);
-            let stat;
-            try {
-              stat = await fs.stat(filePath);
-            } catch {
-              return;
-            }
-            if (stat.size === 0) return;
-
-            const sessionId = basename(fileName, ".jsonl");
-
-            let session: SessionMeta | undefined;
-            try {
-              session = await parseSessionFile(
-                filePath,
-                entry.name,
-                stat.mtimeMs,
-                stat.size,
-                sessionId,
-                cache,
-              );
-            } catch {
-              return;
-            }
-            if (!session) return;
-
-            const treeEntry = treeCache[sessionId];
-            if (
-              treeEntry &&
-              treeEntry.fileMtime === stat.mtimeMs &&
-              treeEntry.data?.customTitle
-            ) {
-              session.customTitle =
-                session.customTitle ?? treeEntry.data.customTitle;
-            }
-
-            results.push(session);
-          }),
-        );
+        return files.map((fileName) => ({
+          filePath: join(projectDir, fileName),
+          projectDirName: entry.name,
+          fileName,
+          treeCache,
+        }));
       }),
   );
+  const tasks = tasksByDir.flat();
 
+  const sessions = await mapWithConcurrency(
+    tasks,
+    SCAN_CONCURRENCY,
+    async (task): Promise<SessionMeta | undefined> => {
+      let stat;
+      try {
+        stat = await fs.stat(task.filePath);
+      } catch {
+        return undefined;
+      }
+      if (stat.size === 0) return undefined;
+
+      const sessionId = basename(task.fileName, ".jsonl");
+
+      let session: SessionMeta | undefined;
+      try {
+        session = await parseSessionFile(
+          task.filePath,
+          task.projectDirName,
+          stat.mtimeMs,
+          stat.size,
+          sessionId,
+          cache,
+        );
+      } catch {
+        return undefined;
+      }
+      if (!session) return undefined;
+
+      const treeEntry = task.treeCache[sessionId];
+      if (
+        treeEntry &&
+        treeEntry.fileMtime === stat.mtimeMs &&
+        treeEntry.data?.customTitle
+      ) {
+        session.customTitle = session.customTitle ?? treeEntry.data.customTitle;
+      }
+
+      return session;
+    },
+  );
+
+  const results = sessions.filter((s): s is SessionMeta => s !== undefined);
   const deduped = dedupeBySessionId(results);
   deduped.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
   return deduped;
