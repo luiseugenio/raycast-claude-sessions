@@ -1,4 +1,4 @@
-# Claude Sessions
+# Claude Code Sessions
 
 A Raycast extension to browse, search, and manage your local Claude Code sessions: the ones you started from the terminal, from Claude Desktop, or from Conductor.
 
@@ -46,7 +46,7 @@ npm install
 npm run dev
 ```
 
-`npm run dev` opens the extension in Raycast in dev mode. Press `⌘+Enter` in Raycast (or just start typing "Claude Sessions") to try it.
+`npm run dev` opens the extension in Raycast in dev mode. Press `⌘+Enter` in Raycast (or just start typing "Claude Code Sessions") to try it.
 
 ## Keyboard shortcuts
 

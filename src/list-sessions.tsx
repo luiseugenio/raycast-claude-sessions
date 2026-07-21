@@ -531,7 +531,7 @@ export default function ListSessions() {
   if (isDemoMode) navigationTitleParts.push("Demo");
   const navigationTitle =
     navigationTitleParts.length > 0
-      ? `Claude Sessions — ${navigationTitleParts.join(" — ")}`
+      ? `Claude Code Sessions — ${navigationTitleParts.join(" — ")}`
       : undefined;
 
   return (
