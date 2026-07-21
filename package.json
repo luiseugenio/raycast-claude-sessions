@@ -5,6 +5,9 @@
   "description": "Browse, search and manage your local Claude Code, Claude Desktop and Conductor sessions",
   "icon": "icon.png",
   "author": "luis_eugenio_militao_braga",
+  "platforms": [
+    "macOS"
+  ],
   "categories": [
     "Developer Tools"
   ],
