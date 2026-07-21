@@ -9,6 +9,7 @@ import {
   List,
   LocalStorage,
   confirmAlert,
+  environment,
   showToast,
   Toast,
   trash,
@@ -40,6 +41,7 @@ import {
   resolveDesktopResumeAction,
 } from "./lib/desktopDeepLink";
 import { computeSessionStatus } from "./lib/sessionStatus";
+import { buildDemoDataset } from "./lib/demoData";
 import {
   DATE_BUCKET_ORDER,
   dateBucket,
@@ -192,6 +194,41 @@ interface RenderedSection {
   items: SessionMeta[];
 }
 
+/** Shown whenever an effectful action is blocked because demo mode is on. */
+async function showDemoDataToast(): Promise<void> {
+  await showToast({
+    style: Toast.Style.Failure,
+    title: "Demo data",
+    message:
+      "This is fake data for screenshots — actions are disabled while it's on.",
+  });
+}
+
+/**
+ * A stand-in for an effectful action (one that would touch the filesystem or
+ * open another app) while demo mode is on — same title/icon/shortcut, but it
+ * just explains itself instead of doing anything. Used for the actions that
+ * can't be guarded with a simple "check first, then proceed" onAction
+ * (Action.Open/Action.CopyToClipboard/Action.ShowInFinder perform their
+ * effect as soon as they're invoked, with no cancelable pre-hook).
+ */
+function demoBlockedAction(
+  title: string,
+  icon: Icon,
+  shortcut?: Keyboard.Shortcut,
+  style?: Action.Style,
+) {
+  return (
+    <Action
+      title={title}
+      icon={icon}
+      shortcut={shortcut}
+      style={style}
+      onAction={() => void showDemoDataToast()}
+    />
+  );
+}
+
 function formatDateTime(date: Date): string {
   return date.toLocaleString(undefined, {
     year: "numeric",
@@ -247,6 +284,21 @@ export default function ListSessions() {
   const { value: groupByValue, setValue: setGroupBy } =
     useLocalStorage<GroupBy>("groupBy", "project");
   const groupBy = groupByValue ?? "project";
+  const { value: demoModeValue, setValue: setDemoModeValue } =
+    useLocalStorage<boolean>("demoMode", false);
+  // `environment.isDevelopment` is checked here too, not just around the
+  // toggle action — so a store build never shows demo data even if this
+  // LocalStorage flag was somehow left on from an earlier dev session.
+  const isDemoMode = environment.isDevelopment && (demoModeValue ?? false);
+  const demoDataset = useMemo(() => buildDemoDataset(), []);
+
+  function guardDemo(): boolean {
+    if (isDemoMode) {
+      void showDemoDataToast();
+      return true;
+    }
+    return false;
+  }
 
   const [searchText, setSearchText] = useState("");
   const [selectedProject, setSelectedProject] = useState<string>("all");
@@ -258,11 +310,21 @@ export default function ListSessions() {
     undefined,
   );
 
-  const allSessions = sessions ?? [];
+  // Every downstream computation (status filtering, project grouping,
+  // search, row rendering) reads only from these four — swapping them for
+  // the fake dataset is enough to make every UI path exercise demo data
+  // without special-casing any of the logic below.
+  const allSessions = isDemoMode ? demoDataset.sessions : (sessions ?? []);
   const renames = renameMap ?? {};
-  const desktopSessions = desktopIndex ?? {};
-  const conductorWorkspaces = conductorWorkspaceMap ?? {};
-  const conductorTitles = conductorTitleMap ?? {};
+  const desktopSessions = isDemoMode
+    ? demoDataset.desktopIndex
+    : (desktopIndex ?? {});
+  const conductorWorkspaces = isDemoMode
+    ? demoDataset.conductorWorkspaces
+    : (conductorWorkspaceMap ?? {});
+  const conductorTitles = isDemoMode
+    ? demoDataset.conductorTitles
+    : (conductorTitleMap ?? {});
 
   // Applied first, ahead of the project dropdown and search, so the project
   // list/counts and search results both reflect "what's actually visible in
@@ -375,10 +437,13 @@ export default function ListSessions() {
     (session) => session.filePath === selectedFilePath,
   );
 
+  // Demo sessions' filePath doesn't exist on disk, so never fire the real
+  // (file-reading) preview fetch for them — buildMarkdown pulls straight from
+  // demoDataset.previewMessages instead when isDemoMode is on.
   const { data: preview, isLoading: isPreviewLoading } = useCachedPromise(
     async (filePath: string, size: number) => getSessionPreview(filePath, size),
     [selectedSession?.filePath ?? "", selectedSession?.size ?? 0],
-    { execute: isShowingDetail && !!selectedSession },
+    { execute: isShowingDetail && !!selectedSession && !isDemoMode },
   );
 
   const { push } = useNavigation();
@@ -444,11 +509,14 @@ export default function ListSessions() {
     // is fetched for that item alone — gate on it so other items never show
     // a stale/mismatched preview.
     if (isShowingDetail && session.filePath === selectedFilePath) {
-      if (isPreviewLoading && !preview) {
+      const messages = isDemoMode
+        ? (demoDataset.previewMessages[session.sessionId] ?? [])
+        : preview;
+      if (!isDemoMode && isPreviewLoading && !preview) {
         parts.push("\n\n---\n\n_Loading conversation preview…_");
-      } else if (preview && preview.length > 0) {
+      } else if (messages && messages.length > 0) {
         parts.push("\n\n---\n\n### Recent messages\n");
-        for (const message of preview) {
+        for (const message of messages) {
           const label = message.role === "user" ? "**You**" : "**Assistant**";
           parts.push(`${label}: ${message.text}\n`);
         }
@@ -457,14 +525,18 @@ export default function ListSessions() {
     return parts.join("\n");
   }
 
+  const navigationTitleParts: string[] = [];
+  if (statusFilter !== "active")
+    navigationTitleParts.push(STATUS_FILTER_LABEL[statusFilter]);
+  if (isDemoMode) navigationTitleParts.push("Demo");
   const navigationTitle =
-    statusFilter === "active"
-      ? undefined
-      : `Claude Sessions — ${STATUS_FILTER_LABEL[statusFilter]}`;
+    navigationTitleParts.length > 0
+      ? `Claude Sessions — ${navigationTitleParts.join(" — ")}`
+      : undefined;
 
   return (
     <List
-      isLoading={isLoading}
+      isLoading={isDemoMode ? false : isLoading}
       isShowingDetail={isShowingDetail}
       navigationTitle={navigationTitle}
       onSearchTextChange={setSearchText}
@@ -490,7 +562,7 @@ export default function ListSessions() {
         </List.Dropdown>
       }
     >
-      {sections.length === 0 && !isLoading ? (
+      {sections.length === 0 && (isDemoMode || !isLoading) ? (
         <List.EmptyView
           icon={Icon.Message}
           title="No sessions found"
@@ -612,7 +684,10 @@ export default function ListSessions() {
                           <Action
                             title="Open in Conductor"
                             icon={Icon.Layers}
-                            onAction={() => handleOpenInConductor(session)}
+                            onAction={() => {
+                              if (guardDemo()) return;
+                              handleOpenInConductor(session);
+                            }}
                           />
                         ) : (
                           /* Default/Enter action: deterministic, side-effect-free —
@@ -623,7 +698,10 @@ export default function ListSessions() {
                           <Action
                             title="Open Claude Desktop"
                             icon={Icon.Desktop}
-                            onAction={() => handleFocusClaudeDesktop()}
+                            onAction={() => {
+                              if (guardDemo()) return;
+                              handleFocusClaudeDesktop();
+                            }}
                           />
                         )}
                         <Action
@@ -640,37 +718,67 @@ export default function ListSessions() {
                           shortcut={{ modifiers: ["cmd"], key: "g" }}
                           onAction={() => setGroupBy(GROUP_BY_CYCLE[groupBy])}
                         />
-                        {!isConductor && (
-                          <Action.Open
-                            title={desktopResumeAction.title}
-                            target={desktopResumeAction.target}
-                            icon={Icon.Tray}
-                            shortcut={{
-                              modifiers: ["cmd", "shift"],
-                              key: "i",
-                            }}
+                        {!isConductor &&
+                          (isDemoMode ? (
+                            demoBlockedAction(
+                              desktopResumeAction.title,
+                              Icon.Tray,
+                              {
+                                modifiers: ["cmd", "shift"],
+                                key: "i",
+                              },
+                            )
+                          ) : (
+                            <Action.Open
+                              title={desktopResumeAction.title}
+                              target={desktopResumeAction.target}
+                              icon={Icon.Tray}
+                              shortcut={{
+                                modifiers: ["cmd", "shift"],
+                                key: "i",
+                              }}
+                            />
+                          ))}
+                        {!isConductor &&
+                          experimentalTarget &&
+                          (isDemoMode ? (
+                            demoBlockedAction(
+                              "Open Session in Claude Desktop (Experimental)",
+                              Icon.Bolt,
+                              { modifiers: ["cmd", "shift"], key: "e" },
+                            )
+                          ) : (
+                            <Action.Open
+                              title="Open Session in Claude Desktop (Experimental)"
+                              target={experimentalTarget}
+                              icon={Icon.Bolt}
+                              shortcut={{
+                                modifiers: ["cmd", "shift"],
+                                key: "e",
+                              }}
+                            />
+                          ))}
+                        {isDemoMode ? (
+                          demoBlockedAction(
+                            "Copy Resume Command",
+                            Icon.CopyClipboard,
+                            Keyboard.Shortcut.Common.Copy,
+                          )
+                        ) : (
+                          <Action.CopyToClipboard
+                            title="Copy Resume Command"
+                            content={`cd ${session.cwd} && claude --resume ${session.sessionId}`}
+                            shortcut={Keyboard.Shortcut.Common.Copy}
                           />
                         )}
-                        {!isConductor && experimentalTarget && (
-                          <Action.Open
-                            title="Open Session in Claude Desktop (Experimental)"
-                            target={experimentalTarget}
-                            icon={Icon.Bolt}
-                            shortcut={{ modifiers: ["cmd", "shift"], key: "e" }}
-                          />
-                        )}
-                        <Action.CopyToClipboard
-                          title="Copy Resume Command"
-                          content={`cd ${session.cwd} && claude --resume ${session.sessionId}`}
-                          shortcut={Keyboard.Shortcut.Common.Copy}
-                        />
                       </ActionPanel.Section>
                       <ActionPanel.Section>
                         <Action
                           title="Rename Session"
                           icon={Icon.Pencil}
                           shortcut={Keyboard.Shortcut.Common.Refresh}
-                          onAction={() =>
+                          onAction={() => {
+                            if (guardDemo()) return;
                             push(
                               <RenameSessionForm
                                 session={session}
@@ -679,19 +787,37 @@ export default function ListSessions() {
                                   handleRename(session, newTitle)
                                 }
                               />,
-                            )
-                          }
+                            );
+                          }}
                         />
-                        <Action.ShowInFinder
-                          title="Open Project Folder"
-                          path={session.cwd}
-                          shortcut={Keyboard.Shortcut.Common.Open}
-                        />
-                        <Action.ShowInFinder
-                          title="Reveal in Finder"
-                          path={session.filePath}
-                          shortcut={{ modifiers: ["cmd", "shift"], key: "f" }}
-                        />
+                        {isDemoMode ? (
+                          demoBlockedAction(
+                            "Open Project Folder",
+                            Icon.Folder,
+                            Keyboard.Shortcut.Common.Open,
+                          )
+                        ) : (
+                          <Action.ShowInFinder
+                            title="Open Project Folder"
+                            path={session.cwd}
+                            shortcut={Keyboard.Shortcut.Common.Open}
+                          />
+                        )}
+                        {isDemoMode ? (
+                          demoBlockedAction("Reveal in Finder", Icon.Finder, {
+                            modifiers: ["cmd", "shift"],
+                            key: "f",
+                          })
+                        ) : (
+                          <Action.ShowInFinder
+                            title="Reveal in Finder"
+                            path={session.filePath}
+                            shortcut={{
+                              modifiers: ["cmd", "shift"],
+                              key: "f",
+                            }}
+                          />
+                        )}
                         <Action
                           title={`Show: ${STATUS_FILTER_LABEL[STATUS_FILTER_CYCLE[statusFilter]]} Sessions`}
                           icon={Icon.Filter}
@@ -713,9 +839,27 @@ export default function ListSessions() {
                           icon={Icon.Trash}
                           style={Action.Style.Destructive}
                           shortcut={{ modifiers: ["ctrl"], key: "x" }}
-                          onAction={() => handleDelete(session)}
+                          onAction={() => {
+                            if (guardDemo()) return;
+                            handleDelete(session);
+                          }}
                         />
                       </ActionPanel.Section>
+                      {environment.isDevelopment && (
+                        <ActionPanel.Section title="Development">
+                          <Action
+                            title={
+                              isDemoMode
+                                ? "Turn off Demo Data"
+                                : "Turn on Demo Data"
+                            }
+                            icon={Icon.Camera}
+                            onAction={() =>
+                              setDemoModeValue(!(demoModeValue ?? false))
+                            }
+                          />
+                        </ActionPanel.Section>
+                      )}
                     </ActionPanel>
                   }
                 />
