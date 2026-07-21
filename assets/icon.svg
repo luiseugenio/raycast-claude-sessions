@@ -1,28 +1,20 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <!-- Flat rounded-square background in Claude's orange -->
   <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="#D97757"/>
-
-  <!-- Chat-bubble motif: a session/conversation -->
+  <!-- Clean speech-bubble silhouette, nothing inside -->
   <path d="
-    M 146 118
-    H 366
-    a 48 48 0 0 1 48 48
-    V 296
-    a 48 48 0 0 1 -48 48
+    M 130 118
+    H 382
+    a 58 58 0 0 1 58 58
+    V 300
+    a 58 58 0 0 1 -58 58
     H 224
-    L 156 392
-    a 10 10 0 0 1 -16 -8
-    L 142 344
-    H 146
-    a 48 48 0 0 1 -48 -48
-    V 166
-    a 48 48 0 0 1 48 -48
+    L 150 400
+    a 12 12 0 0 1 -19 -9
+    L 128 358
+    h 2
+    a 58 58 0 0 1 -58 -58
+    V 176
+    a 58 58 0 0 1 58 -58
     Z"
     fill="#FFFFFF"/>
-
-  <!-- Terminal chevron + underscore inside the bubble: the CLI/session prompt -->
-  <path d="M 208 178 L 268 232 L 208 286"
-        fill="none" stroke="#D97757" stroke-width="30"
-        stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="300" y="266" width="76" height="26" rx="13" fill="#D97757"/>
 </svg>
