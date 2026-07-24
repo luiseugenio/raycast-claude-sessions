@@ -29,6 +29,13 @@
       "subtitle": "Claude Code Sessions",
       "description": "Browse and manage your Claude Code sessions",
       "mode": "view"
+    },
+    {
+      "name": "usage",
+      "title": "Usage",
+      "subtitle": "Claude Code Sessions",
+      "description": "See local token usage and estimated cost by period, model, and project",
+      "mode": "view"
     }
   ],
   "dependencies": {

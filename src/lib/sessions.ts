@@ -588,7 +588,7 @@ async function parseSessionFile(
  * projects and blows the heap on one with years of history. Capping how
  * many run at once bounds total memory regardless of how many files exist.
  */
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,

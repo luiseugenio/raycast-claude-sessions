@@ -19,16 +19,28 @@ The extension figures out which surface each session lives on by itself. You don
 - Lists your sessions, newest first, grouped by project (or by date if you switch the grouping with ⌘G).
 - Searches by title, slug, git branch, or project name.
 - Filters by project with a dropdown, and by status (Active / All / Archived) with ⌘⇧A. The status filter mirrors what Claude Desktop's own sidebar shows as "active", including hiding scheduled-task runs like daily planner sessions.
-- Shows a detail panel (⌘D) with the first prompt, the last few messages, and metadata like branch, worktree, message count, and size on disk.
+- Shows a detail panel (⌘D) with the first prompt, the last few messages, and metadata like branch, worktree, message count, size on disk, and how full the context window is (e.g. `47% · 94k / 200k`, read straight from the session's latest turn).
 - Renames a session (just a local label, it doesn't touch your transcript) and deletes one (moves the file to Trash, never a permanent delete).
 - Copies a resume command (`cd <dir> && claude --resume <id>`) so you can jump back into a session from your terminal.
 - Colors each project's icon so you can tell projects apart at a glance, and tags each row with where the session lives (Claude, Conductor, or CLI).
+
+## Usage command
+
+There's a second command, **Usage**, that adds up token usage and estimated cost from your transcripts:
+
+- Overview by period: last 5 hours, today, last 7 days, last 30 days, and all time.
+- Breakdown by model and by project (all time).
+- A breakdown panel (⌘D) per row with input / output / cache-write / cache-read tokens and the estimated cost.
+
+Cost is an estimate from list prices, not a bill. When a model has no price in the table (a brand-new model, say), its tokens still count but its cost shows as `n/a`, and any total that includes it is marked with `≥` to show it's a floor.
+
+This is not the same as the "usage limits" popover in Claude Code (the 5-hour and weekly limits). Those numbers aren't stored anywhere on disk, they come live from the server, so this command can't show them. What it shows is your own consumption, computed locally.
 
 ## How it works
 
 Everything runs locally, straight from files already on your Mac:
 
-- It reads `~/.claude/projects/**/*.jsonl`, but only the head and tail of each file, never the whole thing. Some transcripts get huge (50MB+), so it streams just enough bytes to get the title, the metadata, and the last few messages.
+- It reads `~/.claude/projects/**/*.jsonl`. For the list it only needs the head and tail of each file (title, metadata, last few messages); the Usage command streams the whole file to add up tokens. Either way it reads in fixed-size chunks and never holds a whole file, or even a whole line, in memory. Some transcripts get huge (50MB+, with single lines many MB wide), so this keeps memory flat no matter how big they get.
 - It reads Claude Desktop's session records (`~/Library/Application Support/Claude/claude-code-sessions`) to know if a session was also opened in the desktop app, and whether it's archived there.
 - It reads Conductor's local sqlite database (read-only) to know about Conductor workspaces and their session titles.
 - Everything is read-only except renaming (stored in Raycast's own local storage) and deleting (which moves the file to Trash, so you can still recover it).
