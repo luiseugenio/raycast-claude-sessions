@@ -1,6 +1,10 @@
 import { homedir } from "os";
 import { join } from "path";
-import { SessionMeta, SessionPreviewMessage } from "./sessions";
+import {
+  SessionContextUsage,
+  SessionMeta,
+  SessionPreviewMessage,
+} from "./sessions";
 import { DesktopSessionInfo } from "./desktopSessions";
 import { ConductorWorkspaceInfo } from "./conductor";
 
@@ -36,6 +40,8 @@ interface DemoSpec {
   firstPrompt: string;
   /** Which title source to exercise — defaults to "custom". */
   titleSource?: "custom" | "ai" | "first-prompt";
+  /** Context-window fill percent to show in the detail panel, if any. */
+  contextPercent?: number;
   preview: SessionPreviewMessage[];
 }
 
@@ -51,6 +57,7 @@ const SPECS: DemoSpec[] = [
     worktree: "fix-flaky-checkout",
     slug: "quiet-river-fern",
     branch: "fix-flaky-checkout",
+    contextPercent: 34,
     firstPrompt:
       "The checkout spec fails about 1 in 10 runs on CI, looks like a race condition around the payment mock. Can you dig in?",
     preview: [
@@ -72,6 +79,7 @@ const SPECS: DemoSpec[] = [
     minutesAgo: 45,
     messageCount: 87,
     sizeBytes: 640_000,
+    contextPercent: 71,
     firstPrompt:
       "Users keep asking for dark mode. Let's start with just the settings screen as a first pass.",
     titleSource: "ai",
@@ -98,6 +106,7 @@ const SPECS: DemoSpec[] = [
     minutesAgo: 130,
     messageCount: 156,
     sizeBytes: 1_100_000,
+    contextPercent: 88,
     firstPrompt:
       "We're moving off CircleCI. Can you port the build/test/deploy pipeline to GitHub Actions?",
     preview: [
@@ -384,6 +393,7 @@ export interface DemoDataset {
   conductorWorkspaces: Record<string, ConductorWorkspaceInfo>;
   conductorTitles: Record<string, string>;
   previewMessages: Record<string, SessionPreviewMessage[]>;
+  contextUsage: Record<string, SessionContextUsage>;
 }
 
 /** Builds the whole fake dataset fresh each time, so relative times stay accurate for long-running dev sessions. */
@@ -393,6 +403,7 @@ export function buildDemoDataset(): DemoDataset {
   const conductorWorkspaces: Record<string, ConductorWorkspaceInfo> = {};
   const conductorTitles: Record<string, string> = {};
   const previewMessages: Record<string, SessionPreviewMessage[]> = {};
+  const contextUsage: Record<string, SessionContextUsage> = {};
 
   for (const spec of SPECS) {
     const cwd = buildCwd(spec);
@@ -425,6 +436,14 @@ export function buildDemoDataset(): DemoDataset {
 
     previewMessages[spec.id] = spec.preview;
 
+    if (spec.contextPercent !== undefined) {
+      contextUsage[spec.id] = {
+        tokens: Math.round((spec.contextPercent / 100) * 200_000),
+        window: 200_000,
+        percent: spec.contextPercent,
+      };
+    }
+
     if (spec.surface === "claude") {
       desktopIndex[spec.id] = {
         localSessionId: `local_${spec.id}`,
@@ -450,5 +469,6 @@ export function buildDemoDataset(): DemoDataset {
     conductorWorkspaces,
     conductorTitles,
     previewMessages,
+    contextUsage,
   };
 }

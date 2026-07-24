@@ -47,6 +47,7 @@ import {
   dateBucket,
   deriveProjectRoot,
   deriveWorktreeOrCityLabel,
+  formatTokenCount,
   humanFileSize,
   isConductorCwd,
   prettyProjectName,
@@ -523,7 +524,7 @@ export default function ListSessions() {
     if (isShowingDetail && session.filePath === selectedFilePath) {
       const messages = isDemoMode
         ? (demoDataset.previewMessages[session.sessionId] ?? [])
-        : preview;
+        : preview?.messages;
       if (!isDemoMode && isPreviewLoading && !preview) {
         parts.push("\n\n---\n\n_Loading conversation preview…_");
       } else if (messages && messages.length > 0) {
@@ -627,6 +628,13 @@ export default function ListSessions() {
                 : status === "other" && desktopSessions[session.sessionId]
                   ? { tag: { value: "Scheduled", color: Color.SecondaryText } }
                   : undefined;
+              // Context fill is only known for the selected item (its preview is
+              // the only one fetched); in demo mode it comes from the fixture.
+              const contextUsage = isDemoMode
+                ? demoDataset.contextUsage[session.sessionId]
+                : session.filePath === selectedFilePath
+                  ? preview?.context
+                  : undefined;
 
               return (
                 <List.Item
@@ -668,6 +676,12 @@ export default function ListSessions() {
                             title="Messages"
                             text={String(session.messageCount)}
                           />
+                          {contextUsage ? (
+                            <List.Item.Detail.Metadata.Label
+                              title="Context"
+                              text={`${contextUsage.percent}% · ${formatTokenCount(contextUsage.tokens)} / ${formatTokenCount(contextUsage.window)}`}
+                            />
+                          ) : null}
                           <List.Item.Detail.Metadata.Label
                             title="Created"
                             text={formatDateTime(session.createdAt)}

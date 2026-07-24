@@ -69,6 +69,14 @@ export function humanFileSize(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
 }
 
+/** Compact token count, e.g. "94k", "1.2k" → "1k", "200k", "1M". */
+export function formatTokenCount(tokens: number): string {
+  if (tokens < 1000) return String(tokens);
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
+  const millions = tokens / 1_000_000;
+  return `${millions % 1 === 0 ? millions.toFixed(0) : millions.toFixed(1)}M`;
+}
+
 /**
  * Best-effort prettified project name for the filter dropdown, derived from a
  * real `cwd` value observed in session data (never from the encoded project

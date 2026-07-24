@@ -52,6 +52,8 @@ const HEAD_MAX_LINES = 60;
 const HEAD_MAX_BYTES = 96 * 1024;
 const TAIL_MAX_BYTES = 128 * 1024;
 const PREVIEW_MESSAGE_COUNT = 3;
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+const LARGE_CONTEXT_WINDOW = 1_000_000;
 
 export type EntrypointKind = "claude-desktop" | "conductor" | "cli";
 
@@ -82,6 +84,36 @@ export interface SessionPreviewMessage {
   text: string;
 }
 
+/**
+ * The token usage a Claude API response records for one assistant turn. The
+ * three input tiers plus the output together are the context occupied right
+ * after that turn — see `contextTokensFromUsage`.
+ */
+interface UsageBlock {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/** How full a session's context window is, derived from its latest assistant turn. */
+export interface SessionContextUsage {
+  /** Tokens occupying the context after the most recent assistant turn. */
+  tokens: number;
+  /** Window the percentage is measured against (200k, or 1M for large-context sessions). */
+  window: number;
+  /** `tokens / window` as a whole percent, capped at 100. */
+  percent: number;
+  /** Model that produced the most recent turn, if the transcript recorded it. */
+  model?: string;
+}
+
+/** What the detail panel loads lazily for the selected session. */
+export interface SessionPreview {
+  messages: SessionPreviewMessage[];
+  context?: SessionContextUsage;
+}
+
 interface JsonlRecord {
   type?: string;
   sessionId?: string;
@@ -94,7 +126,12 @@ interface JsonlRecord {
   isSidechain?: boolean;
   customTitle?: string;
   aiTitle?: string;
-  message?: { role?: string; content?: unknown };
+  message?: {
+    role?: string;
+    content?: unknown;
+    model?: string;
+    usage?: UsageBlock;
+  };
 }
 
 function safeParseLine(line: string): JsonlRecord | undefined {
@@ -692,11 +729,50 @@ function dedupeBySessionId(sessions: SessionMeta[]): SessionMeta[] {
   return Array.from(bySessionId.values());
 }
 
-/** Reads the last few real messages of a session file for the detail preview. */
+/**
+ * Sums an assistant `usage` block into the tokens occupying the context right
+ * after that turn: everything the model read in (fresh input plus both cache
+ * tiers) plus what it generated. This is the figure Claude Code's own context
+ * meter reports.
+ */
+function contextTokensFromUsage(usage: UsageBlock): number {
+  return (
+    (usage.input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0) +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.output_tokens ?? 0)
+  );
+}
+
+function buildContextUsage(
+  usage: UsageBlock,
+  model?: string,
+): SessionContextUsage | undefined {
+  const tokens = contextTokensFromUsage(usage);
+  if (tokens <= 0) return undefined;
+  // The transcript doesn't record whether the 1M-context beta was on, but a
+  // session already holding more than the standard window must have been on
+  // it — that's enough to pick the right denominator without the request
+  // header.
+  const window =
+    tokens > DEFAULT_CONTEXT_WINDOW
+      ? LARGE_CONTEXT_WINDOW
+      : DEFAULT_CONTEXT_WINDOW;
+  const percent = Math.min(100, Math.round((tokens / window) * 100));
+  return { tokens, window, percent, model };
+}
+
+/**
+ * Reads the last few real messages of a session file for the detail preview,
+ * plus how full its context window is (from the most recent assistant turn's
+ * recorded `usage`). Both come from the same bounded tail read; the context
+ * figure is simply absent if the latest assistant turn falls outside the tail
+ * window or predates per-turn usage reporting.
+ */
 export async function getSessionPreview(
   filePath: string,
   size: number,
-): Promise<SessionPreviewMessage[]> {
+): Promise<SessionPreview> {
   const tail = await readTailText(filePath, size);
   const rawLines = tail.split("\n").filter(Boolean);
   // The first line of a tail read is very likely a truncated partial line; drop it
@@ -704,13 +780,18 @@ export async function getSessionPreview(
   const lines = size > TAIL_MAX_BYTES ? rawLines.slice(1) : rawLines;
 
   const messages: SessionPreviewMessage[] = [];
-  for (
-    let i = lines.length - 1;
-    i >= 0 && messages.length < PREVIEW_MESSAGE_COUNT;
-    i--
-  ) {
+  let context: SessionContextUsage | undefined;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (messages.length >= PREVIEW_MESSAGE_COUNT && context) break;
     const record = safeParseLine(lines[i]);
     if (!record || record.isSidechain) continue;
+
+    // The most recent assistant turn's usage is the current context fill.
+    if (!context && record.type === "assistant" && record.message?.usage) {
+      context = buildContextUsage(record.message.usage, record.message.model);
+    }
+
+    if (messages.length >= PREVIEW_MESSAGE_COUNT) continue;
     if (record.type !== "user" && record.type !== "assistant") continue;
     const role = record.message?.role;
     if (role !== "user" && role !== "assistant") continue;
@@ -720,5 +801,5 @@ export async function getSessionPreview(
     if (!text) continue;
     messages.push({ role, text: capText(text, 1000) });
   }
-  return messages.reverse();
+  return { messages: messages.reverse(), context };
 }
